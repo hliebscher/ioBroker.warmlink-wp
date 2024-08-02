@@ -1,0 +1,1000 @@
+// Midas Poolheizung
+// v0.0.12
+// Changelog:
+// 0.0.12: Ausgangstemperatur des Kompressors (exhaust) sowie Produkt- und Geräte-ID hinzugefügt
+//         neue Produkt-IDs hinzugefügt (ungetestet)
+// 0.0.11: Request zu Acios migriert
+// 0.0.10: Weitere Parameter für andere Gerätetypen hinzugefügt
+// 0.0.8: Testweise Unterstützung von neu registrierten Anlagen
+// 0.0.7: Kleinigkeiten überarbeitet
+//        weitere Modelle hinzugefügt
+// 0.0.6: Gültigkeitsprüfung des Zertifikats deaktiviert (Dank an znyde)
+//        Kompatibilität mit Promo Next Modellen durch generische Product-ID (Dank an znyde)
+// 0.0.5: weitere Abfragewerte hinzugefügt (Kompressor- und Ansaugtemperatur)
+// 0.0.4: Tokenverfall jetzt 60min nach Skriptstart und nicht zu jeder vollen Stunde (Dank an dering)
+// 0.0.3: Datenpunkte beim Start automatisch anlegen (Dank an Andy200877)
+// 0.0.2: Token bei jedem Set-Vorgang prüfen und ggf. neu anfordern (Dank an dering)
+ 
+// ANFANG konfigurierbare Elemente -----
+const username = "EMAIL";
+var password = "KENNWORT";
+ 
+const interval = 30; // Abfrageintervall in Sekunden
+ 
+const dpRoot = "0_userdata.0.Poolheizung"; // Stammordner der Datenpunkte
+ 
+const apilevel = 3;   // 1: AquaTemp-Accounts, die vor v.1.5.8 erstellt wurden
+                      // 2: HiTemp-Accounts
+                      // 3: AquaTemp-Accounts, die mit neueren App-Versionen erstellt wurden
+ 
+var debugLevel = 0;   // 0: keine erweiterten Informationen protokollieren
+                        // 1: Debug-Informationen protokollieren
+ 
+// ENDE --------------------------------
+ 
+var cloudURL;
+ 
+var token = "";
+var tokenRefreshTimer;
+var device = "";
+ 
+// ProductIDs:
+// Gruppe 1:
+// 1132174963097280512: Midas/Poolsana InverPro
+const AQUATEMP_POOLSANA="1132174963097280512";
+ 
+// Gruppe 2:
+// 1442284873216843776: 
+const AQUATEMP_OTHER1="1442284873216843776";
+ 
+var product = "";
+var reachable = false;
+ 
+const axios = require('axios');
+ 
+function setupEndpoints() {
+    if(apilevel==1) {
+        cloudURL = "https://cloud.linked-go.com/cloudservice/api";
+    } else if(apilevel==2) {
+        cloudURL = "https://cloud.linked-go.com/cloudservice/api";
+    } else if(apilevel==3) {
+        cloudURL = "https://cloud.linked-go.com:449/crmservice/api";
+        password = require('crypto').createHash('md5').update(password).digest("hex");
+    }
+    printLog("API-Level " + apilevel, 1);
+}
+ 
+function clearValues() {
+    saveValue("error", true, "boolean");
+    saveValue("consumption", 0, "number");
+    saveValue("state", false, "boolean");
+    saveValue("rawJSON", null, "string");
+}
+ 
+function saveValue(key, value, sType) {
+    var dp = dpRoot + "." + key;
+ 
+    if ( !existsState(dp )) {
+        printLog("Schreibe in NEUEN Datenpunkt: " + dp + " - " + value, 1);
+        createState(dp,value,{name: key,  type: 'number', role: 'value'}, function () {}); 
+    } else {
+        printLog("Schreibe in Datenpunkt: " + dp + " - " + value, 1);
+        setState(dp,value,true);
+    }
+}
+ 
+function findCodeVal(result, code) {
+    //log(code + " " + result.length);
+    //log(result);
+    printLog("Suche Wert " + code, 1);
+    for(var i=0; i<result.length; i++) {
+        //log(result[i].code);
+        printLog(result[i].code, 1);
+        if(result[i].code.indexOf(code) >= 0) {
+            printLog("Wert gefunden: " + result[i].value, 1);
+            return result[i].value;
+        }
+    }
+    return "";
+}
+ 
+function createobjects() {
+    log ("erstelle Objekte");
+    createState(dpRoot + '.ambient', {read: true, write: false,  type: "number", unit:"°C", role: "value.temperature", name: "Umgebungstemperatur"});
+    createState(dpRoot + '.connection', {read: true, write: false,  type: "boolean", role: "state", name: "Verbindung", def: false});
+    createState(dpRoot + '.consumption', {read: true, write: false,  type: "number", unit:"W", role: "value.power", name: "Stromverbrauch", def: 0});
+    createState(dpRoot + '.error', {read: true, write: false,  type: "boolean", role: "state", name: "Fehler", def: false});
+    createState(dpRoot + '.errorCode', {read: true, write: false,  type: "string", name: "Fehlercode", def: ""});
+    createState(dpRoot + '.errorLevel', {read: true, write: false,  type: "number", name: "Fehlerlevel"});
+    createState(dpRoot + '.errorMessage', {read: true, write: false,  type: "string", name: "Fehlermeldung", def: ""});
+    createState(dpRoot + '.mode', {read: true, write: true,  type: "string", states: "-1:off;0:cool;1:heat;2:auto", name: "Modus", def: ""});
+    createState(dpRoot + '.rotor', {read: true, write: false,  type: "number", unit:"rpm", def: 0, name: "Lüfterdrehzahl"});
+    createState(dpRoot + '.silent', {read: true, write: true,  type: "boolean", role: "state", name: "Silent", def: false});
+    createState(dpRoot + '.state', {read: true, write: false,  type: "boolean", role: "state", name: "Status", def: false});
+    createState(dpRoot + '.tempIn', {read: true, write: false,  type: "number", unit:"°C", role: "value.temperature", name: "Eingangstemperatur"});
+    createState(dpRoot + '.tempOut', {read: true, write: false,  type: "number", unit:"°C", role: "value.temperature", name: "Ausgangstemperatur"});
+    createState(dpRoot + '.tempSet', {read: true, write: true,  type: "number", unit:"°C", role: "level.temperature", name: "Solltemperatur"});
+    createState(dpRoot + '.suctionTemp', {read: true, write: false,  type: "number", unit:"°C", name: "Luftansaugtemperatur"});
+    createState(dpRoot + '.coilTemp', {read: true, write: false,  type: "number", unit:"°C", role: "value.temperature", name: "Kompressortemperatur"});
+    createState(dpRoot + '.exhaust', {read: true, write: false,  type: "number", unit:"°C", role: "value.temperature", name: "Kompressorausgang"});
+    createState(dpRoot + '.ProductCode', {read: true, write: false,  type: "string", name: "Produktcode"});
+    createState(dpRoot + '.DeviceCode', {read: true, write: false,  type: "string", name: "Geräte-ID"});
+    
+    createState(dpRoot + '.rawJSON', {read: true, write: false,  type: "array", name: "komplette Rückgabe"});
+}
+ 
+function updateToken() {
+ 
+    if(token=="") {
+        printLog("Token Neuanforderung");
+        var options;
+        var sUrl="";
+    
+        if(apilevel<3) {
+            sUrl = cloudURL + '/app/user/login.json';
+            options = {
+                "user_name": username, "password": password, "type": "2"
+            };
+        } else {
+            sUrl = cloudURL + '/app/user/login';
+            options = {
+                "userName": username, "password": password, "type": "2"
+            };
+        }
+        
+ 
+        axios.post(sUrl, options)
+ 
+                .then(function (response) {
+                    printLog("Login-Antwort: " + response.data);
+                    if(response.status==200) {
+                        if(apilevel<3) {
+                            token = response.data.object_result["x-token"];
+                        } else {
+                            token = response.data.objectResult["x-token"];
+                        }
+                        printLog("Login ok! Token " + token);
+                        //log("Token " + token);
+                        updateDeviceID();
+                    } else {
+                        // Error!
+                        printLog("Login-Fehler in updateToken(): " + response.data);
+                        token = "";
+                        saveValue("connection", false, "boolean");
+                    }
+                    })
+                    .catch(function (error) {
+                        // Error!
+                        printLog("Login-Fehler in updateToken(): " + error);
+                        token = "";
+                        saveValue("connection", false, "boolean");        
+                    });
+    } else {
+        // Token war ok
+        updateDeviceID();
+    }
+ 
+    
+ 
+    
+ 
+}
+ 
+function updateDeviceID() {
+    if(token!="") {
+        var sURL;
+        if(apilevel<3) {
+            sURL = cloudURL + '/app/device/deviceList.json';
+        } else {
+            sURL = cloudURL + '/app/device/deviceList';
+        }
+ 
+        axios.post(sURL, {
+            "productIds": [
+                "1132174963097280512",
+                "1245226668902080512",
+                "1656269521923575808", 
+                "1663080854333558784", 
+                "1596427678569979904", 
+                "1674238226096406528", 
+                "1650063968998252544", 
+                "1668781858447085568", 
+                "1186904563333062656", 
+                "1158905952238313472", 
+                "1442284873216843776", 
+                "1732565142225256450", 
+                "1548963836789501952", 
+                "1669159229372477440", 
+                "1650758828508766208", 
+                "1664085465655808000"
+                ]
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            if(response.status==200) {
+                printLog("DeviceList: " + JSON.stringify(response.data));
+                if(response.data.error_code==0) {
+                    if(apilevel<3) {
+                        device = response.data.object_result[0].device_code;
+                        product = response.data.object_result[0].product_id;
+                        reachable = (response.data.object_result[0].device_status=="ONLINE");
+                    } else {
+                        device = response.data.objectResult[0].deviceCode;
+                        product = response.data.objectResult[0].productId;
+                        reachable = (response.data.objectResult[0].deviceStatus=="ONLINE");
+                    }
+ 
+                    printLog("DeviceCode: " + device + ", ProductID: " + product + ", DeviceStatus: " + reachable);
+                    saveValue("DeviceCode", device, "string");
+                    saveValue("ProductCode", product, "string");
+ 
+                    if(reachable) {
+                        saveValue("connection", true, "boolean");
+                        if(device!="") updateDeviceStatus(device);
+                    } else {
+                        // offline
+                        device = "";
+                        saveValue("connection", false, "boolean");
+                    }
+                } else {
+                    // Login-Fehler
+                    log("Fehler in updateDeviceID(): " + JSON.stringify(response.data), "error");
+                    token = "";
+                    device = "";
+                    reachable = false;
+                    saveValue("connection", false, "boolean");
+                }
+            } else {
+                // Login-Fehler
+                log("Fehler in updateDeviceID(): " + JSON.stringify(response.data), "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+            })
+            .catch(function (error) {
+                // Login-Fehler
+                log("Fehler in updateDeviceID(): " + error, "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            });
+    }
+}
+ 
+function updateDeviceStatus(devicecode) {
+    if(token!="") {
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/getDeviceStatus.json';
+        } else {
+            sURL=cloudURL + '/app/device/getDeviceStatus';
+        }
+ 
+        axios.post(sURL, {
+            "device_code": devicecode,
+            "deviceCode": devicecode
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            printLog("DeviceStatus: " + response.data);
+            if(parseInt(response.data.error_code)==0) {
+                
+                if(apilevel<3) {
+                    if(response.data.object_result["is_fault"]==true) {
+                        // TODO: Fehlerbeschreibung abrufen
+                        //clearValues();
+                        saveValue("error", true, "boolean");
+                        updateDeviceDetails(devicecode);
+                        updateDeviceErrorMsg(devicecode);
+                    } else {
+                        // kein Fehler
+                        saveValue("error", false, "boolean");
+                        saveValue("errorMessage", "", "string");
+                        saveValue("errorCode", "", "string");
+                        saveValue("errorLevel", 0, "number");
+                        updateDeviceDetails(devicecode);
+                    }
+                } else {
+                    if(response.data.objectResult["is_fault"]==true) {
+                        // TODO: Fehlerbeschreibung abrufen
+                        //clearValues();
+                        saveValue("error", true, "boolean");
+                        updateDeviceDetails(devicecode);
+                        updateDeviceErrorMsg(devicecode);
+                    } else {
+                        // kein Fehler
+                        saveValue("error", false, "boolean");
+                        saveValue("errorMessage", "", "string");
+                        saveValue("errorCode", "", "string");
+                        saveValue("errorLevel", 0, "number");
+                        updateDeviceDetails(devicecode);
+                    }
+                }
+            } else {
+                log("Fehler in updateDeviceStatus(): " + JSON.stringify(response.data), "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceStatus(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+    }
+}
+ 
+function updateDeviceErrorMsg(devicecode) {
+    if(token!="") {
+        var optionsDev;
+ 
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/getFaultDataByDeviceCode.json';
+        } else {
+            sURL=cloudURL + '/app/device/getFaultDataByDeviceCode';
+        }
+ 
+        axios.post(sURL, {
+            "device_code": devicecode,
+            "deviceCode": devicecode
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+           
+            if(parseInt(response.data.error_code)==0) {
+ 
+                
+                saveValue("error", true, "boolean");
+ 
+                if(apilevel<3) {
+                    saveValue("errorMessage", response.data.object_result[0].description, "string");
+                    saveValue("errorCode", response.data.object_result[0].fault_code, "string");
+                    saveValue("errorLevel", response.data.object_result[0].error_level, "string");
+                } else {
+                    saveValue("errorMessage", response.data.objectResult[0].description, "string");
+                    saveValue("errorCode", response.data.objectResult[0].fault_code, "string");
+                    saveValue("errorLevel", response.data.objectResult[0].error_level, "string");
+                }
+                
+                
+            } else {
+                // Login-Fehler
+                token = "";
+                device = "";
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceErrorMsg(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+ 
+    }
+}
+ 
+function updateDeviceDetails(devicecode) {
+    // AXIOS
+    if(token!="") {
+        var optionsDev;
+        var sURL;
+        if(apilevel<3) {
+            sURL = cloudURL + '/app/device/getDataByCode.json';
+        } else {
+            sURL = cloudURL + '/app/device/getDataByCode';
+        }
+ 
+        axios.post(sURL, {
+            "device_code": devicecode,
+            "deviceCode": devicecode,
+            "protocal_codes":[
+                        "Power",
+                        "Mode",
+                        "Manual-mute",
+                        "T01",
+                        "T02",
+                        "2074",
+                        "2075",
+                        "2076",
+                        "2077",
+                        "H03",
+                        "Set_Temp",
+                        "R08",
+                        "R09",
+                        "R10",
+                        "R11",
+                        "R01",
+                        "R02",
+                        "R03",
+                        "T03",
+                        "1158",
+                        "1159",
+                        "F17",
+                        "H02",
+                        "T04",
+                        "T05",
+                        "T06",
+                        "T07",
+                        "T14",
+                        "T17",
+                        "T1",
+                        "T2",
+                        "T3",
+                        "T4",
+                        "T5",
+                        "T6",
+                        "T7"],
+            "protocalCodes":[
+                        "Power",
+                        "Mode",
+                        "Manual-mute",
+                        "T01",
+                        "T02",
+                        "2074",
+                        "2075",
+                        "2076",
+                        "2077",
+                        "H03",
+                        "Set_Temp",
+                        "R08",
+                        "R09",
+                        "R10",
+                        "R11",
+                        "R01",
+                        "R02",
+                        "R03",
+                        "T03",
+                        "1158",
+                        "1159",
+                        "F17",
+                        "H02",
+                        "T04",
+                        "T05",
+                        "T06",
+                        "T07",
+                        "T14",
+                        "T17",
+                        "T1",
+                        "T2",
+                        "T3",
+                        "T4",
+                        "T5",
+                        "T6",
+                        "T7"]
+ 
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+//            log(response.data)
+            
+            printLog("DeviceDetails: " + response.data);
+ 
+            if(parseInt(response.data.error_code)==0) {
+ 
+                if(apilevel<3) {
+                    if(debugLevel==1) saveValue("rawJSON", response.data.object_result, "string");
+                    
+                    if(findCodeVal(response.data.object_result, "Power")=="1") {
+                        if(product==AQUATEMP_POOLSANA) {
+                            // Stromverbrauch T07 x T14 in Watt
+                            saveValue("consumption", parseFloat(findCodeVal(response.data.object_result, "T07")) * parseFloat(findCodeVal(response.data.object_result, "T14")), "number");
+                            // Luftansaug-Temperatur T01
+                            saveValue("suctionTemp", parseFloat(findCodeVal(response.data.object_result, "T01")), "number");
+                            // Inlet-Temperatur T02
+                            saveValue("tempIn", parseFloat(findCodeVal(response.data.object_result, "T02")), "number");
+                            // outlet-Temperatur T03
+                            saveValue("tempOut", parseFloat(findCodeVal(response.data.object_result, "T03")), "number");
+                            // Coil-Temperatur T04
+                            saveValue("coilTemp", parseFloat(findCodeVal(response.data.object_result, "T04")), "number");
+                            // Umgebungs-Temperatur T05
+                            saveValue("ambient", parseFloat(findCodeVal(response.data.object_result, "T05")), "number");
+                            // Kompressorausgang-Temperatur T06
+                            saveValue("exhaust", parseFloat(findCodeVal(response.data.object_result, "T06")), "number");
+                        } else if (product==AQUATEMP_OTHER1) {
+                            // Stromverbrauch T7 x T14 in Watt
+                            saveValue("consumption", parseFloat(findCodeVal(response.data.object_result, "T7")) * parseFloat(findCodeVal(response.data.object_result, "T14")), "number");
+                            // Luftansaug-Temperatur T1
+                            saveValue("suctionTemp", parseFloat(findCodeVal(response.data.object_result, "T1")), "number");
+                            // Inlet-Temperatur T2
+                            saveValue("tempIn", parseFloat(findCodeVal(response.data.object_result, "T2")), "number");
+                            // outlet-Temperatur T3
+                            saveValue("tempOut", parseFloat(findCodeVal(response.data.object_result, "T3")), "number");
+                            // Coil-Temperatur T4
+                            saveValue("coilTemp", parseFloat(findCodeVal(response.data.object_result, "T4")), "number");
+                            // Umgebungs-Temperatur T5
+                            saveValue("ambient", parseFloat(findCodeVal(response.data.object_result, "T5")), "number");
+                            // Kompressorausgang-Temperatur T6
+                            saveValue("exhaust", parseFloat(findCodeVal(response.data.object_result, "T6")), "number");
+                        }
+                    
+                        // Lüfter-Drehzahl T17
+                        saveValue("rotor", parseInt(findCodeVal(response.data.object_result, "T17")), "number");
+                      
+                        
+                    } else {
+                        saveValue("consumption", 0, "number");
+                        saveValue("rotor", 0, "number");
+                    }
+    
+                    // Ziel-Temperatur Set_Temp
+                    //saveValue("tempSet", parseFloat(findCodeVal(body.object_result, "Set_Temp")), "number");
+ 
+                    // Ziel-Temperatur anhand Modus
+                    if(findCodeVal(response.data.object_result,"Mode") == 1) {
+                        // Heiz-Modus (-> R02)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.object_result, "R02")), "number");
+                    } else if(findCodeVal(response.data.object_result,"Mode") == 0) {
+                        // Kühl-Modus (-> R01)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.object_result, "R01")), "number");
+                    } else if(findCodeVal(response.data.object_result,"Mode") == 2) {
+                        // Auto-Modus (-> R03)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.object_result, "R03")), "number");
+                    }
+ 
+        
+                    // Flüstermodus Manual-mute
+                    if(findCodeVal(response.data.object_result, "Manual-mute")=="1") {
+                        saveValue("silent", true, "boolean");
+                    } else {
+                        saveValue("silent", false, "boolean");
+                    }
+    
+                    // Zustand Power
+                    if(findCodeVal(response.data.object_result, "Power")=="1") {
+                        saveValue("state", true, "boolean");
+                        saveValue("mode", findCodeVal(response.data.object_result,"Mode"), "string");
+                    } else {
+                        saveValue("state", false, "boolean");
+                        saveValue("mode", "-1", "string");
+                    }
+                    
+                    saveValue("connection", true, "boolean");
+ 
+                    // Durchlauf ENDE
+    
+                    
+                } else {
+                    if(debugLevel==1) saveValue("rawJSON", response.data.objectResult, "string");
+                    
+                    if(findCodeVal(response.data.objectResult, "Power")=="1") {
+                        if(product==AQUATEMP_POOLSANA) {
+                            // Stromverbrauch T07 x T14 in Watt
+                            saveValue("consumption", parseFloat(findCodeVal(response.data.objectResult, "T07")) * parseFloat(findCodeVal(response.data.objectResult, "T14")), "number");
+                            // Luftansaug-Temperatur T01
+                            saveValue("suctionTemp", parseFloat(findCodeVal(response.data.objectResult, "T01")), "number");
+                            // Inlet-Temperatur T02
+                            saveValue("tempIn", parseFloat(findCodeVal(response.data.objectResult, "T02")), "number");
+                            // outlet-Temperatur T03
+                            saveValue("tempOut", parseFloat(findCodeVal(response.data.objectResult, "T03")), "number");
+                            // Coil-Temperatur T04
+                            saveValue("coilTemp", parseFloat(findCodeVal(response.data.objectResult, "T04")), "number");
+                            // Umgebungs-Temperatur T05
+                            saveValue("ambient", parseFloat(findCodeVal(response.data.objectResult, "T05")), "number");
+                            // Kompressorausgang-Temperatur T06
+                            saveValue("exhaust", parseFloat(findCodeVal(response.data.objectResult, "T06")), "number");
+                        } else if (product==AQUATEMP_OTHER1) {
+                            // Stromverbrauch T7 x T14 in Watt
+                            saveValue("consumption", parseFloat(findCodeVal(response.data.objectResult, "T7")) * parseFloat(findCodeVal(response.data.objectResult, "T14")), "number");
+                            // Luftansaug-Temperatur T1
+                            saveValue("suctionTemp", parseFloat(findCodeVal(response.data.objectResult, "T1")), "number");
+                            // Inlet-Temperatur T2
+                            saveValue("tempIn", parseFloat(findCodeVal(response.data.objectResult, "T2")), "number");
+                            // outlet-Temperatur T3
+                            saveValue("tempOut", parseFloat(findCodeVal(response.data.objectResult, "T3")), "number");
+                            // Coil-Temperatur T4
+                            saveValue("coilTemp", parseFloat(findCodeVal(response.data.objectResult, "T4")), "number");
+                            // Umgebungs-Temperatur T5
+                            saveValue("ambient", parseFloat(findCodeVal(response.data.objectResult, "T5")), "number");
+                            // Kompressorausgang-Temperatur T6
+                            saveValue("exhaust", parseFloat(findCodeVal(response.data.objectResult, "T6")), "number");
+                        }
+                    
+                        // Lüfter-Drehzahl T17
+                        saveValue("rotor", parseInt(findCodeVal(response.data.objectResult, "T17")), "number");
+                      
+                        
+                    } else {
+                        saveValue("consumption", 0, "number");
+                        saveValue("rotor", 0, "number");
+                    }
+    
+                    // Ziel-Temperatur Set_Temp
+                    //saveValue("tempSet", parseFloat(findCodeVal(body.objectResult, "Set_Temp")), "number");
+ 
+                    // Ziel-Temperatur anhand Modus
+                    if(findCodeVal(response.data.objectResult,"Mode") == 1) {
+                        // Heiz-Modus (-> R02)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.objectResult, "R02")), "number");
+                    } else if(findCodeVal(response.data.objectResult,"Mode") == 0) {
+                        // Kühl-Modus (-> R01)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.objectResult, "R01")), "number");
+                    } else if(findCodeVal(response.data.objectResult,"Mode") == 2) {
+                        // Auto-Modus (-> R03)
+                        saveValue("tempSet", parseFloat(findCodeVal(response.data.objectResult, "R03")), "number");
+                    }
+        
+                    // Flüstermodus Manual-mute
+                    if(findCodeVal(response.data.objectResult, "Manual-mute")=="1") {
+                        saveValue("silent", true, "boolean");
+                    } else {
+                        saveValue("silent", false, "boolean");
+                    }
+    
+                    // Zustand Power
+                    if(findCodeVal(response.data.objectResult, "Power")=="1") {
+                        saveValue("state", true, "boolean");
+                        saveValue("mode", findCodeVal(response.data.objectResult,"Mode"), "string");
+                    } else {
+                        saveValue("state", false, "boolean");
+                        saveValue("mode", "-1", "string");
+                    }
+                    
+                    saveValue("connection", true, "boolean");
+ 
+                    // Durchlauf ENDE
+    
+                    
+                }
+ 
+                
+            } else {
+                // Login-Fehler
+                log("Fehler in updateDeviceDetails(): " + JSON.stringify(response.data), "error");
+                token = "";
+                device = "";
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceDetails(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+            
+ 
+        
+    }
+}
+ 
+function updateDevicePower(devicecode, power) {
+    var powerOpt;
+    var powerMode = 2;
+ 
+    if(power==-1) {
+        // aus
+        powerOpt = 0;
+        powerMode = -1;
+    } else if(power==0) {
+        // an und kühlen
+        powerOpt = 1;
+        powerMode = 0;
+    } else if(power==1) {
+        // an und heizen
+        powerOpt = 1;
+        powerMode = 1;
+    } else if(power==2) {
+        // an und auto
+        powerOpt = 1;
+        powerMode = 2;
+    } else {
+        log("ungülter Zustand!");
+        return;
+    }
+ 
+    if(token!="") {
+ 
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/control.json';
+        } else {
+            sURL=cloudURL + '/app/device/control';
+        }
+ 
+        axios.post(sURL, {
+            "param": [{
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "Power",
+                "protocolCode": "Power",
+                "value": powerOpt
+            }]
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            printLog("DeviceStatus: " + response.data);
+            if(parseInt(response.data.error_code)==0) {
+                
+                saveValue("mode", power.toString(), "string");
+                if(power>=0) updateDeviceMode(device, power);
+                
+            } else {
+                log("Fehler in updateDevicePower(): " + response.data, "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDevicePower(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+ 
+    }
+}
+ 
+function updateDeviceMode(devicecode, mode) {
+    
+ 
+    if(token!="") {
+ 
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/control.json';
+        } else {
+            sURL=cloudURL + '/app/device/control';
+        }
+ 
+        axios.post(sURL, {
+            "param": [{
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "mode",
+                "protocolCode": "mode",
+                "value": mode
+            }]
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            printLog("DeviceStatus: " + response.data);
+            if(parseInt(response.data.error_code)==0) {
+                
+                saveValue("mode", mode, "string");
+                
+            } else {
+                log("Fehler in updateDeviceMode(): " + response.data, "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceMode(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+ 
+    }
+}
+ 
+function updateDeviceSilent(devicecode, silent) {
+    
+    var silentMode;
+ 
+    if(silent) {
+        silentMode = "1";
+    } else {
+        silentMode = "0";
+    }
+ 
+    if(token!="") {
+ 
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/control.json';
+        } else {
+            sURL=cloudURL + '/app/device/control';
+        }
+ 
+        axios.post(sURL, {
+            "param": [{
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "Manual-mute",
+                "protocolCode": "Manual-mute",
+                "value": silentMode
+            }]
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            printLog("DeviceStatus: " + response.data);
+            if(parseInt(response.data.error_code)==0) {
+                
+                saveValue("silent", silent, "boolean");
+                
+            } else {
+                log("Fehler in updateDeviceSilent(): " + response.data, "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceSilent(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+ 
+    }
+}
+ 
+function updateDeviceSetTemp(devicecode, temperature) {
+ 
+    var sTemperature = temperature.toString().replace(",", ".");
+    var sMode = getState(dpRoot + ".mode").val;
+    if(sMode=="-1") {
+        //log("Gerät einschalten um Temperatur zu ändern!", 'warn');
+        return;
+    } else if(sMode=="0") {
+        sMode = "R01"; // Kühlen
+    } else if(sMode=="1") {
+        sMode = "R02"; // Heizen
+    } else if(sMode=="2") {
+        sMode = "R03"; // Auto
+    }
+ 
+    
+ 
+ 
+    if(token!="") {
+ 
+        var sURL="";
+ 
+        if(apilevel<3) {
+            sURL=cloudURL + '/app/device/control.json';
+        } else {
+            sURL=cloudURL + '/app/device/control';
+        }
+ 
+        axios.post(sURL, {
+            "param": [
+                {
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "R01",
+                "protocolCode": "R01",
+                "value": sTemperature
+                },
+                {
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "R02",
+                "protocolCode": "R02",
+                "value": sTemperature
+                },
+                {
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "R03",
+                "protocolCode": "R03",
+                "value": sTemperature
+                },
+                {
+                "device_code": devicecode,
+                "deviceCode": devicecode,
+                "protocol_code": "Set_Temp",
+                "protocolCode": "Set_Temp",
+                "value": sTemperature
+                }
+                ]
+        }, {
+            headers: { "x-token": token },
+        })
+        .then(function (response) {
+            printLog("DeviceStatus: " + response.data);
+            if(parseInt(response.data.error_code)==0) {
+                
+                saveValue("tempSet", temperature, "number");
+                
+            } else {
+                log("Fehler in updateDeviceSetTemp(): " + response.data, "error");
+                token = "";
+                device = "";
+                reachable = false;
+                saveValue("connection", false, "boolean");
+            }
+        })
+        .catch(function (error) {
+            // Login-Fehler
+            log("Fehler in updateDeviceSetTemp(): " + error, "error");
+            token = "";
+            device = "";
+            reachable = false;
+            saveValue("connection", false, "boolean");
+        });
+    }
+}
+ 
+function printLog(sMsg, minLevel = 1) {
+    if(debugLevel>=minLevel) {
+        log(sMsg);
+    }
+}
+ 
+function productIsAquaTemp(productid) {
+ 
+}
+ 
+// Beginn des Skripts
+ 
+setupEndpoints();
+createobjects(); // DPs anlegen
+clearValues();
+ 
+updateToken(); // Zugriffstoken erfragen und aktuelle Werte lesen
+ 
+schedule('*/' + interval + ' * * * * *', function () {
+    // regelmäßig Token und Zustand abfragen
+    updateToken();
+ 
+    // gewünschte Änderungen ausführen
+    if(!getState(dpRoot + ".mode").ack) {
+        updateDevicePower(device, getState(dpRoot + ".mode").val);
+    }
+    if(!getState(dpRoot + ".silent").ack) {
+        updateDevicePower(device, getState(dpRoot + ".silent").val);
+    }
+});
+ 
+tokenRefreshTimer = setInterval(function () {
+    // Token verfällt nach 60min
+    token = "";
+    //log("Token nach Intervall verworfen.")
+    updateToken();
+}, 3600000);
+ 
+on({id: dpRoot + ".mode", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDevicePower(device, getState(dpRoot + ".mode").val);
+});
+ 
+on({id: dpRoot + ".silent", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDeviceSilent(device, getState(dpRoot + ".silent").val);
+});
+ 
+on({id: dpRoot + ".tempSet", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDeviceSetTemp(device, getState(dpRoot + ".tempSet").val);
+});
+ 
+ 

@@ -1,0 +1,1026 @@
+// Waermepumpe neue Version 1.8 05.06.2023
+// Gondzig 
+// getDatabyCode holt alle Werte
+// getDeviceStatus holt 
+// get
+// gettoken
+
+
+
+//Array of api endpoints
+const apiEndpoints = {
+    getToken:                           'https://cloud.linked-go.com:449/crmservice/api/crm/avoidLogin/getToken',
+    getUserInfo:                        'https://cloud.linked-go.com:449/crmservice/api/app/user/getUserInfo',
+    getMyTobeAppectDeviceShareDataList: 'https://cloud.linked-go.com:449/crmservice/api/app/device/getMyTobeAppectDeviceShareDataList',
+    getMyAppectDeviceShareDataList:     'https://cloud.linked-go.com:449/crmservice/api/app/device/getMyAppectDeviceShareDataList',
+    deviceList:                         'https://cloud.linked-go.com:449/crmservice/api/app/device/deviceList',
+    login:                              'https://cloud.linked-go.com:449/crmservice/api/app/user/login',
+    logout:                             'https://cloud.linked-go.com:449/crmservice/api/app/user/logout',
+    control:                            'https://cloud.linked-go.com:449/crmservice/api/app/device/control',
+    getDataByCode:                      'https://cloud.linked-go.com:449/crmservice/api/app/device/getDataByCode',
+    getDeviceStatus:                    'https://cloud.linked-go.com:449/crmservice/api/app/device/getDeviceStatus'
+};
+
+const apilevel = 3;   // 1: AquaTemp-Accounts, die vor v.1.5.8 erstellt wurden
+                      // 2: HiTemp-Accounts
+                      // 3: AquaTemp-Accounts, die mit neueren App-Versionen erstellt wurden
+ 
+const debugLevel = 1;   // 0: keine erweiterten Informationen protokollieren
+                        // 1: Debug-Informationen protokollieren
+
+var header = {"Content-Type": "application/json; charset=utf-8"};
+var key = "" ;
+var product_id = "";
+var leistung_e = 0 ;
+var leistung_t = 0 ;
+
+const username = "hliebscher@gmail";
+const password = "dimnPf2023!#";
+const xpassword = "651f833a076ac84a2704a306605337a2";
+const interval = 30;
+ 
+const cloudURL = "https://cloud.linked-go.com:449/crmservice/api";
+
+const dpRoot = "0_userdata.0.Wp";
+ 
+var token = "";
+var device = ""; 
+var device_id = "";
+var reachable = false;
+var tokenRefreshTimer;
+var silentMode;
+var sessionid = "";
+var devicecode = "860147054215015";
+var device_status = "";
+var datenholen; 
+
+
+// ------------------------------ Functions ---------------------------------
+
+/**
+* @param {number} a
+* @param {number} b
+*/
+function mathRandomInt(a, b) {
+  if (a > b) {
+    // Swap a and b to ensure a is smaller.
+    var c = a;
+    a = b;
+    b = c;
+  }
+  return Math.floor(Math.random() * (b - a + 1) + a);
+}
+
+/**
+* @param {string} sMsg
+*/
+function printLog(sMsg, minLevel = 1) {
+    if(debugLevel>=minLevel) {
+        log(sMsg);
+    }
+}
+
+function clearValues() {
+    saveValue("error", true, "boolean");
+    saveValue("consumption", 0, "number");
+    saveValue("state", false, "boolean");
+}
+
+//prüft ob ein Datenpunkt existiert 
+/**
+* @param {string} key
+
+* */
+function saveValue(key, value, sType) {
+    var dp = dpRoot + "." + key;
+          
+    if ( !existsState(dp )) {
+        printLog("Neuer Datenpunkt: erzeugt " + dp);
+        createState(dp,value,{"name": key,  "type": sType , "role": "value"}, function () {}); 
+       
+        
+    } else {
+        if (getState(dp).val != value) {
+            //nur wenn Wert sich ändert
+            printLog("Neu anlegen " + dp + " " + value);
+            setState(dp, value);
+        }
+        else {
+            //ToDo für debug
+            //printLog("Wert unverändert " + dp );
+        }
+    }
+}
+ 
+ 
+ 
+/**
+* @param {string | any[]} result
+* @param {string} code
+*/
+function findCodeVal(result, code) {
+    //printLog(code);
+    for(var i=0; i<result.length; i++) {
+        //printLog(result[i].code);
+        
+        if(result[i].code.indexOf(code) >= 0) {
+            return result[i].value;
+        }
+    }
+    return "";
+}
+
+//prüft auf gültiges login der app
+function getUserInfo() {
+        printLog ("Funktion > getUserInfo");
+        var optionsDev = {
+            url: cloudURL + '/app/user/getUserInfo?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8"} ,
+            json: { 
+                "appId": "16"
+                 },
+            method: 'POST',
+                         };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));    
+            if(parseInt(body.error_code)==0) {
+               printLog("Login funktioniert!");
+                
+            } else {
+                printLog("Fehler beim Login!");
+                printLog(body.error_msg);
+                //dann token und devicecode löschen
+                token = "";
+                devicecode = "";
+            }
+            
+        });
+}
+
+
+
+
+
+
+
+//macht einen neuen Login und holt den Token
+//https://cloud.linked-go.com:449/crmservice/api/app/user/login
+//wenn token vorhanden und der devicecode vorhanden ist, wird der status abgefragt
+function updateToken() {
+     
+    if(token=="") {
+        printLog ("Funktion > updateToken");
+        var request = require('request');
+        var optionsDev = {
+            url: cloudURL + '/app/user/login?lang=en',
+            method: 'POST',
+            headers: {"Content-Type": "application/json; charset=utf-8"} ,
+            json: { 
+                "password": "651f833a076ac84a2704a306605337a2",
+                "loginSource": "IOS",
+                "areaCode": "de",
+                "appId": "16",
+                "type": "2",
+                "userName": "hliebscher@gmail.com"
+            }
+        };
+        request(optionsDev,function (error, response, body){
+            //Test auf Erfolg 
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                token = body.objectResult["x-token"];
+                printLog("neuer Token= erzeugt" );
+                saveValue("x-token", token , "string");
+                saveValue("user_id",     body.objectResult["user_id"], "string");
+                saveValue("real_name",   body.objectResult["real_name"], "string");
+                saveValue("accessKey",   body.objectResult["accessKey"], "string");
+                saveValue("user_type",   body.objectResult["user_type"], "string");
+                
+                //neuer token vorhanden, jetzt devicecode abfragen
+                updateDeviceID();
+
+            } else {
+                printLog("Login-Fehler!");
+                printLog(body.error_msg); 
+                token = "";
+            }
+        });
+    } 
+    else {
+        //printLog("Token vorhanden: ")
+        //nur wenn devicecode nicht vorhanden ist
+        if (devicecode == "") {
+            updateDeviceID();
+        }      
+        //hole den deviceStatus       
+        getDeviceStatus(devicecode);
+    }
+ 
+}
+
+
+function updateDeviceID() {
+    //nur wenn devicecode nicht vorhanden ist
+    if (devicecode == "" && token != "") {
+    printLog ("Funktion > updateDeviceID");
+         
+        var optionsDev =    {
+            url: cloudURL + '/app/device/deviceList?lang=en',
+            method: 'POST',
+            headers: {
+                    "Content-Type": "application/json; charset=utf-8", 
+                    "x-token": token, 
+                    "User-Agent": "hai wai cai nuan/1.8.0 (iPad; iOS 16.4; Scale/2.00)",
+                    "Accept-Encoding": "gzip, deflate, br" 
+                    } ,
+            json: {
+                "productIds": [
+                  "1194901186696777728",
+                  "1239430558124097536",
+                  "1255021944487620608",
+                  "1280068488723034112",
+                  "1339750000640499712",
+                  "1314389730321776640",
+                  "1534426457089150976",
+                  "1430840899188973568",
+                  "1151012720393330688",
+                  "1390463737449857024",
+                  "1442056800068329472",
+                  "1473911871244337152",
+                  "1506552523736190976",
+                  "1552190345066967040",
+                  "1534450342119510016",
+                  "1480699335514533888",
+                  "1501438265440362496",
+                  "1501438265440362496",
+                  "1544970221549498368",
+                  "1559733647991496705"
+                ],
+                "appId": "16",
+                "pageIndex": "1",
+                "pageSize": "999"
+              }
+                            };
+ 
+  
+        var request = require('request');
+         request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                sessionid = body.objectResult[0].sessionid;
+                devicecode = body.objectResult[0].deviceCode;
+                device_id  = body.objectResult[0].device_id;
+                device_status  = body.objectResult[0].device_status;    
+                saveValue("deviceCode",     body.objectResult[0].deviceCode, "string");
+                saveValue("isReusltSuc",     body.objectResult[0].isReusltSuc, "string");
+                saveValue("device_id",      body.objectResult[0].device_id, "string");
+                saveValue("deviceId",       body.objectResult[0].deviceId, "string");             //neu
+                saveValue("device_status",  body.objectResult[0].device_status, "string");
+                saveValue("deviceSstatus",  body.objectResult[0].deviceStatus, "string");         //neu
+                saveValue("product_id",     body.objectResult[0].product_id, "string");
+                saveValue("productId",      body.objectResult[0].productId, "string");            //neu
+                saveValue("model",          body.objectResult[0].model, "string");
+                saveValue("sn",             body.objectResult[0].sn, "string");
+                saveValue("connection", true, "boolean");
+                
+                    //ToDo
+                    getDeviceStatus(devicecode);
+                
+            } else {
+                printLog ("DeviceID Fehler!");
+                printLog(body.error_msg);
+                token = "";
+                devicecode = "";
+                reachable = false;
+            }
+            
+        });
+
+    }
+        //wenn devicecode vorhanden ist, hole den Status
+        else {
+        getDeviceStatus(devicecode);
+        }    
+}
+ 
+/**
+* @param {string} devicecode
+*/
+function getDeviceStatus(devicecode) {
+    //token und devicecode vorhanden
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > getDeviceStatus");
+        var optionsDev = {
+            url: cloudURL + '/app/device/getDeviceStatus?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: { 
+                "appId": "16",
+                "deviceCode": devicecode 
+                  },
+            method: 'POST',
+                         };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                //printLog("Device Status ok!");
+                    saveValue("error_code", parseInt(body.error_code) , "number");
+                    saveValue("error_msg", body.error_msg, "string");
+                    saveValue("error_msg_code", body.error_msg_code, "string");
+                    getDataByCode(devicecode);
+                }
+            else {
+                //den Fehlercode ausgeben
+                    printLog ("Fehler: " + body.error_msg);
+                    if (body.error_msg == "请重新登录" ){
+                        printLog("Bitte erneut anmelden.");
+                        };
+                    token = "";
+                    devicecode = "";
+            }
+            
+        });
+    }
+    //devicecode oder token nicht vorhanden hole neuen token
+    else {
+        updateToken();
+    }
+
+}
+
+ 
+/**
+* @param {string} devicecode
+*/
+function getFaultDataByDeviceCode(devicecode) {
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > getFaultDataByDeviceCode");
+        var optionsDev = {
+            url: cloudURL + '/app/device/getFaultDataByDeviceCode?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: { 
+                "deviceCode": devicecode ,
+                "appId": "16"
+                 },
+            method: 'POST',
+                         };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                saveValue("error", true, "boolean");
+                saveValue("error_msg", body.objectResult[0].description, "string");
+                saveValue("error_code", body.objectResult[0].fault_code, "string");
+                saveValue("error_level", body.objectResult[0].error_level, "string");
+                
+            } else {
+                printLog("Fehler beim Abrufen!");
+                printLog(body.error_msg);
+                token = "";
+                devicecode = "";
+            }
+            
+        });
+    }
+}
+ 
+/**
+* @param {string} devicecode
+*/
+function getDataByCode(devicecode) {
+    //nur wenn devicecode und token vorhanden
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > getDataByCode");
+        var optionsDev = {
+            url: cloudURL + '/app/device/getDataByCode?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            method: 'POST',
+            json: {
+                "deviceCode": devicecode,
+                "appId": "16",
+                "protocalCodes": [
+                "Power",
+                "Mode",
+                "hanControl",
+                "H01",
+                "H33",
+                "H03",
+                "H05",
+                "H07",
+                "H10",
+                "H27",
+                "H28",
+                "H21",
+                "H22",
+                "H18",
+                "H20",
+                "H29",
+                "H25",
+                "H30",
+                "A03",
+                "A04",
+                "A05",
+                "A06",
+                "H31",
+                "A11",
+                "A23",
+                "A24",
+                "H32",
+                "A21",
+                "A22",
+                "A25",
+                "F01",
+                "F02",
+                "F03",
+                "F05",
+                "F06",
+                "F05_2",
+                "F06_2",
+                "F10",
+                "F18",
+                "F19",
+                "F21",
+                "F22",
+                "F23",
+                "F25",
+                "F26",
+                "D01-1",
+                "D01-2",
+                "D02",
+                "D03",
+                "D04",
+                "D07",
+                "D08",
+                "D09",
+                "D10-1",
+                "D10-2",
+                "D11-1",
+                "D11-2",
+                "D12",
+                "D13",
+                "D14",
+                "D15",
+                "E01",
+                "E02",
+                "E03",
+                "E07",
+                "E08",
+                "E09",
+                "E10",
+                "E13",
+                "E14",
+                "E17",
+                "E18",
+                "G01",
+                "G02",
+                "G03",
+                "G04",
+                "G05",
+                "R01",
+                "R02",
+                "R03",
+                "R04",
+                "R05",
+                "R08",
+                "R09",
+                "R10",
+                "R11",
+                "R15",
+                "R29",
+                "R30",
+                "R31",
+                "R32",
+                "R33",
+                "R34",
+                "R35",
+                "R06",
+                "R07",
+                "R36",
+                "R37",
+                "R39",
+                "R40",
+                "R41",
+                "R16",
+                "R17",
+                "P01",
+                "P02",
+                "P03",
+                "P05",
+                "C01",
+                "C02",
+                "C03",
+                "C04",
+                "C05",
+                "C06",
+                "C07",
+                "C08",
+                "C09",
+                "R42",
+                "R43",
+                "R44",
+                "R45",
+                "R46",
+                "1256",
+                "1257",
+                "1258",
+                "1259",
+                "1260",
+                "1261",
+                "1262",
+                "1263",
+                "1264",
+                "1265",
+                "1266",
+                "1267",
+                "1268",
+                "1269",
+                "ModeState",
+                "O01~014",
+                "O15",
+                "O17",
+                "S01~S10",
+                "T40",
+                "T41",
+                "T42",
+                "T43",
+                "T44",
+                "T36",
+                "T37",
+                "T38",
+                "T01",
+                "T02",
+                "T08",
+                "T04",
+                "T03",
+                "T45",
+                "T05",
+                "T12",
+                "T06",
+                "T35",
+                "T09",
+                "T33",
+                "T34",
+                "T10",
+                "T11",
+                "T15",
+                "T30",
+                "T31",
+                "T32",
+                "T27",
+                "T28",
+                "T29",
+                "T39",
+                "Fault7",
+                "Fault8",
+                "Fault9",
+                "Fault1",
+                "Fault2",
+                "Fault3",
+                "Fault4",
+                "Fault5",
+                "code_version",
+                "MainBoard Version",
+                "Fault6",
+                "H36",
+                "2014",
+                "compensate_slope",
+                "compensate_offset"
+                ]
+              },
+        };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            
+            //Test auf Erfolg
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc) + " " + parseInt(body.error_code));
+            
+            if(parseInt(body.error_code)==0) {
+             //nur wenn Power=1  
+             if(parseFloat(findCodeVal(body.objectResult, "Power"))==1) {
+             printLog("E= "+ (parseFloat(findCodeVal(body.objectResult, "T37")))+ " " + (parseFloat(findCodeVal(body.objectResult, "T36"))) +" " + (Math.round(parseFloat(findCodeVal(body.objectResult, "T37")) * parseFloat(findCodeVal(body.objectResult, "T36")))));
+             leistung_e = (Math.round(parseFloat(findCodeVal(body.objectResult, "T31"))/86 * parseFloat(findCodeVal(body.objectResult, "T36"))*52000)/100); //173-> 125
+             leistung_t = (Math.round(parseFloat(findCodeVal(body.objectResult, "T39")) *  1163  * (parseFloat(findCodeVal(body.objectResult, "T02"))  - parseFloat(findCodeVal(body.objectResult, "T01")))*100)/100);
+               saveValue("Leistung_E", leistung_e , "number");
+               saveValue("Leistung_T", leistung_t , "number");
+             
+               //nur wenn Leistung_T > 8 und Leistung_E > 100
+               if (leistung_e > 100 && leistung_t > 8) { 
+                 //setState("mqtt.0.openWB.SmartHome.set.Devices.9.Powerc", ('' + (parseFloat(1000) * getState("sourceanalytix.0.0_userdata__0__Wp__Leistung_E.cumulativeReading").val)));
+                 //setState("mqtt.0.openWB.set.lp.3.kWhCounter", ('' + getState("sourceanalytix.0.0_userdata__0__Wp__Leistung_E.cumulativeReading").val ));
+                 //setState("mqtt.0.openWB.set.lp.3.W",('' + parseFloat(leistung_e) )); 
+                  saveValue("COP", (leistung_t / leistung_e), "number");
+                  //setState("mqtt.0.openWB.SmartHome.set.Devices.8.Aktpower",parseFloat(leistung_e));
+              };
+               } else {
+               //werte auf 0 setzen 
+               printLog("Gerät ist aus!");
+               saveValue("Leistung_E", 0, "number");
+               saveValue("Leistung_T", 0, "number");
+               }
+                
+ saveValue("Power", parseFloat(findCodeVal(body.objectResult, "Power")), "number");
+ saveValue("Mode", parseFloat(findCodeVal(body.objectResult, "Mode")), "number");
+ saveValue("SilentMode", ("" + (findCodeVal(body.objectResult, "hanControl"))), "string");
+ saveValue("Cool_Temp", parseFloat(findCodeVal(body.objectResult, "R03")), "number");
+ saveValue("Heat_Temp", parseFloat(findCodeVal(body.objectResult, "R02")), "number");
+ saveValue("Water_Temp", parseFloat(findCodeVal(body.objectResult, "R01")), "number");
+ saveValue("Float", parseFloat(findCodeVal(body.objectResult, "T39")), "number");
+ saveValue("Water_In", parseFloat(findCodeVal(body.objectResult, "T01")), "number");
+ saveValue("Water_Out", parseFloat(findCodeVal(body.objectResult, "T02")), "number");
+ saveValue("Warmwasser", parseFloat(findCodeVal(body.objectResult, "T08")), "number");
+ saveValue("Outdoor_Temp", parseFloat(findCodeVal(body.objectResult, "T04")), "number");
+ saveValue("Suction_Temp", parseFloat(findCodeVal(body.objectResult, "T05")), "number");
+ saveValue("AntiFreez_Temp", parseFloat(findCodeVal(body.objectResult, "T06")), "number");
+ saveValue("In_Sys1_Temp", parseFloat(findCodeVal(body.objectResult, "T10")), "number");
+ saveValue("Out_Sys1_Temp", parseFloat(findCodeVal(body.objectResult, "T11")), "number");
+ saveValue("Exth_Temp", parseFloat(findCodeVal(body.objectResult, "T12")), "number");
+ saveValue("Pressure", parseFloat(findCodeVal(body.objectResult, "T15")), "number");
+ saveValue("Fan1", parseFloat(findCodeVal(body.objectResult, "T27")), "number");
+ saveValue("Fan2", parseFloat(findCodeVal(body.objectResult, "T28")), "number");
+ saveValue("Fan_Soll", parseFloat(findCodeVal(body.objectResult, "T29")), "number");
+ saveValue("Comp_Freq", parseFloat(findCodeVal(body.objectResult, "T30")), "number");
+ saveValue("Operation_Freq", parseFloat(findCodeVal(body.objectResult, "T31")), "number");
+ saveValue("AC_V", parseFloat(findCodeVal(body.objectResult, "T34")), "number");
+ saveValue("AC_Power", parseFloat(findCodeVal(body.objectResult, "T36")), "number");
+ saveValue("DC_V", parseFloat(findCodeVal(body.objectResult, "T37")), "number");
+ saveValue("ModeState", parseFloat(findCodeVal(body.objectResult, "ModeState")), "number")
+            } else {
+                printLog("Fehler beim Abrufen!");
+                printLog(body.error_msg);
+                token = "";
+                devicecode = "";
+            }
+            
+        });
+    }
+}
+
+/**
+* @param {string} devicecode
+* @param {string} param
+* @param {string} value
+*/
+function setDeviceParam(devicecode, param, value) {
+    
+    //nur wenn devicecode und token vorhanden
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > setDeviceParam"); 
+        var optionsDev = {
+            url: cloudURL + '/app/device/control?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: {
+                "param":[
+                    {   "deviceCode": devicecode, 
+                        "value": value ,
+                        "protocolCcode": param 
+                    }
+                        ],
+                  "appId": "16"           
+                  },
+            method: 'POST',
+                         };
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog(param + " = " + value );
+            } else {
+                printLog(param + " nicht gesetzt!");
+            }
+        });
+    }
+} 
+
+
+/**
+* @param {string} devicecode
+* @param {string} power
+*/
+
+
+function setDevicePowerOn(devicecode, power) {
+
+if (devicecode != "" && token != "") {
+        getDataByCode(devicecode);
+        printLog ("Funktion > setDevicePower: " + power );     
+        var optionsDev = {
+            url: cloudURL + '/app/device/control?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: {
+                "param": [
+                    {
+                    "value": "1",
+                    "protocolCode": "Power",
+                    "deviceCode": "860147054215015"
+                    }
+                    ],
+                "appId": "16"
+                  },
+                method: 'POST',
+                         };
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Set Power: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog("Erfolgreich Set Power = " + power )
+            } else {
+                printLog("Zustandsänderung fehlgeschlagen!");
+            }
+            
+        });
+    }
+    printLog ("Hier Stimmt was nicht!");
+}
+
+
+
+
+function setDevicePower(devicecode, power) {
+    
+    if (devicecode != "" && token != "") {
+        //getDataByCode(devicecode);
+        printLog ("Funktion > setDevicePower: " + power);     
+        var optionsDev = {
+           url: cloudURL + '/app/device/control?lang=en',
+           headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+           method: 'POST',
+           json: {
+                "param":[
+                    {    
+                    "value": power ,
+                    "protocolCcode": "Power",
+                    "deviceCode": "860147054215015"// devicecode
+                    }
+                    ],
+                  "appId": "16"  
+                  },
+                         };
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Set Power: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog("Erfolgreich Set Power = " + power )
+            } else {
+                printLog("Zustandsänderung fehlgeschlagen!");
+            }
+            
+        });
+    }
+}
+ 
+
+/**
+* @param {string} devicecode
+* @param {string} powermode
+*/
+function setDeviceMode(devicecode, powermode) {
+    
+    //nur wenn devicecode und token vorhanden
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > setDeviceMode " + powermode);       
+        var optionsDev = {
+            url: cloudURL + '/app/device/control?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: {
+                "param":[
+                    {   "deviceCode": devicecode,
+                        "protocolCcode":"Mode",
+                        "value": powermode 
+                    }
+                        ],
+                    "appId": "16"    
+                },
+            method: 'POST',
+                        };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog("Mode = " + powermode );    
+            } 
+            else {
+                printLog("Mode nicht gesetzt!");
+            }
+        });
+    }
+}
+ 
+/**
+* @param {string} devicecode
+* @param {string | number | boolean | Record<string, any>} silent
+*/
+function updateDeviceSilent(devicecode, silent) {
+
+    
+    if(silent) {
+        silentMode = "0000000000000010";
+    } else {
+        silentMode = "0000000000000000";
+    }
+    //nur wenn devicecode und token vorhanden 
+    if (devicecode != "" && token != "") {
+        printLog ("Funktion > updateDeviceSilent");        
+        var optionsDev = {
+            url: cloudURL + '/app/device/control?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: {
+                "param":[
+                    {   "deviceCode": devicecode, 
+                        "protocolCcode": "hanControl", 
+                        "value": silentMode 
+                    }
+                        ],
+                    "appId": "16"
+                  },
+                    method: 'POST',
+                        };
+ 
+        var request = require('request');
+ 
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog("Silentmode = " + silentMode );
+                saveValue("silent", silent, "boolean");
+                
+            } else {
+                printLog("Silentmode = fehlgeschlagen");
+            }
+            
+        });
+    }
+}
+ 
+
+
+function deviceSetTemp(devicecode, temperature) {
+    if (devicecode != "" && token != "") {
+    // TODO: Nur Wert für aktuellen Modus setzen
+    printLog ("Funktion > deviceSetTemp");
+    getDataByCode(devicecode);
+    
+    var sTemperature = temperature.toString().replace(",", ".");
+    var sMode = getState(dpRoot + ".Mode").val;
+    if(sMode=="-1") {
+        //printLog("Gerät einschalten um Temperatur zu ändern!", 'warn');
+        return;
+    } else if(sMode=="0") {
+        sMode = "R01"; // Kühlen
+    } else if(sMode=="1") {
+        sMode = "R02"; // Heizen
+    } else if(sMode=="2") {
+        sMode = "R03"; // Auto
+    }
+        
+        var optionsDev = {
+            url: cloudURL + '/app/device/control?lang=en',
+            headers: {"Content-Type": "application/json; charset=utf-8", "x-token": token} ,
+            json: {
+                "param":[{ 
+                    "deviceCode": devicecode, 
+                    "protocolCcode": sMode,
+                    "value": sTemperature 
+                        }],
+                        "appId": "16"
+                    },
+            method: 'POST',
+                        };
+ 
+        var request = require('request');
+
+        //printLog(optionsDev);
+
+        request(optionsDev,function (error, response, body){
+            printLog("Abruf erfogreich: " + parseBool(body.isReusltSuc));
+            if(parseInt(body.error_code)==0) {
+                printLog("Soll-Temperatur = " + temperature );
+                saveValue("Soll_Temp", temperature, "number");
+                
+            } else {
+                printLog("Temperaturänderung fehlgeschlagen");
+            }
+            
+        });
+    }
+    //kein devicecode oder token vorhanden
+}
+ 
+// ------------------------------ Main ---------------------------------
+
+printLog("Script gestartet");
+
+updateToken(); // Login und Zugriffstoken erfragen und aktuelle Werte lesen und speichern
+ 
+//schedule('*/' + interval + ' * * * * *', function () {
+    // regelmäßig Token und Zustand abfragen
+  //  updateToken();
+    //getDeviceStatus(devicecode);
+    
+    // gewünschte Änderungen ausführen
+ //   if(!getState(dpRoot + ".mode").ack) {
+ //       updateDevicePower(devicecode, getState(dpRoot + ".mode").val);
+ //   }
+ //   if(!getState(dpRoot + ".silent").ack) {
+ //       updateDevicePower(devicecode, getState(dpRoot + ".silent").val);
+ //   }
+//});
+ 
+ 
+/* on({id: dpRoot + ".mode", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDevicePower(devicecode, getState(dpRoot + ".mode").val);
+});
+ 
+on({id: dpRoot + ".silent", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDeviceSilent(devicecode, getState(dpRoot + ".silent").val);
+});
+ 
+on({id: dpRoot + ".tempSet", change: "ne", ack: false}, function (obj) {
+    updateToken();
+    updateDeviceSetTemp(devicecode, getState(dpRoot + ".tempSet").val);
+});
+ 
+
+schedule("* * * * *", async function () {
+  printLog("CRON Jede Minute");
+  printLog(token);
+  updateToken();
+});
+
+schedule("0 5 * * *", async function () {
+  token = "";
+  updateToken();
+}); 
+ */
+
+on({id: dpRoot + ".setPower", change: "ne", ack: false}, async function (obj) {
+    //updateToken();
+   // if (getState(dpRoot + ".setPower").val != getState("0_userdata.0.Wp.Power").val) {
+        printLog("Setze Power auf: "+ getState(dpRoot + ".setPower").val) ;
+        setDevicePower(devicecode, getState(dpRoot + ".setPower").val);
+       // saveValue("Power", getState(dpRoot + ".setPower").val, "number");
+    //} 
+    //else printLog ("Nichts zu tun)");
+});
+ 
+on({id: dpRoot + ".silent", change: "ne", ack: false}, async function (/** @type {any} */ obj) {
+        printLog("Setze Silent");    
+         //  updateToken();
+        updateDeviceSilent(devicecode, getState(dpRoot + ".silent").val);
+});
+
+on({id: dpRoot + ".setTemp", change: "ne", ack: false}, async function (/** @type {any} */ obj) {
+    printLog("Setze Temperatur");
+    //    updateToken();
+    if (getState("0_userdata.0.Wp.setTemp").val != getState("0_userdata.0.Wp.Heat_Temp").val) {
+        setState("0_userdata.0.Wp.setTemp"/*setTemp*/, (Math.min(Math.max(getState("0_userdata.0.Wp.setTemp").val, 40), 60)));
+        printLog('Wert neu ' + getState("0_userdata.0.Wp.setTemp") ); 
+        deviceSetTemp(devicecode, getState(dpRoot + ".setTemp").val);
+    } 
+});
+
+    datenholen = setInterval(async () => {
+        printLog("Daten holen ...");
+        updateToken();;
+    }, 30000);
+
+    tokenRefreshTimer = setInterval(function () {
+        // Token verfällt nach 60min
+        printLog("Token nach Intervall verworfen.");
+        token = "";
+        //log("Token nach Intervall verworfen.")
+        updateToken();
+    },3600000);
+
+function parseBool(str) {
+  
+  if (str.length == null) {
+    return str == 1;
+  } else {
+    return str == "true";
+  }
+ 
+}
+
+    onStop(function () {
+        // Wird beim Stoppen des Skripts aufgerufen.
+        printLog("Script angehalten");
+        clearInterval(tokenRefreshTimer);
+        clearInterval(datenholen);
+    });
+
